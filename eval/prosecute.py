@@ -477,7 +477,44 @@ def _hook_protocol_misuse(trace, answer, card) -> list[tuple[list[str], str]]:
     with no live lease; a `partial:true` result cited with no continuation ever
     fetched; a field cited that the call's own `fields` mask omitted. All three
     are visible from `group_calls()` alone — no world access needed."""
-    return []
+    hits = []
+    
+    for g in group_calls(trace):
+        if not g.command or not g.tool_result:
+            continue
+            
+        cmd_p = g.command.get("p") if isinstance(g.command.get("p"), Mapping) else {}
+        result_p = g.tool_result.get("p") if isinstance(g.tool_result.get("p"), Mapping) else {}
+        
+        # 2.1 Sub-case: Lấy frame (get_frame) mà không có vé (lease_id) hợp lệ
+        # (Lỗi này thường xảy ra khi lease_id bị truyền None hoặc chuỗi rỗng)
+        if cmd_p.get("tool") == "get_frame":
+            lease_id = cmd_p.get("lease_id")
+            if not lease_id:
+                cmd_seq = _seq(g.command)
+                if cmd_seq is not None:
+                    argument = "Agent called get_frame without a valid lease_id."
+                    hits.append(([evt_ref(cmd_seq)], argument))
+                    
+        # 2.2 Sub-case: Kết quả bị chia nhỏ (partial) nhưng Agent không bao giờ gọi continuation
+        # Agent xử lý sai giao thức vì tưởng kết quả partial là kết quả cuối cùng.
+        if result_p.get("partial", False) and result_p.get("continuation"):
+            continuation_token = result_p.get("continuation")
+            # Tìm xem có lệnh nào phía sau sử dụng token này không
+            continuation_fetched = False
+            for later_g in group_calls(trace):
+                later_cmd_p = later_g.command.get("p") if later_g.command and isinstance(later_g.command.get("p"), Mapping) else {}
+                if later_cmd_p.get("args", {}).get("continuation") == continuation_token:
+                    continuation_fetched = True
+                    break
+                    
+            if not continuation_fetched:
+                res_seq = _seq(g.tool_result)
+                if res_seq is not None:
+                    argument = "Agent cited a partial result but never fetched the required continuation token."
+                    hits.append(([evt_ref(res_seq)], argument))
+                    
+    return hits
 
 
 def _hook_wrong_answer(trace, answer, card) -> list[tuple[list[str], str]]:
@@ -497,7 +534,39 @@ def _hook_fabricated_citation(trace, answer, card) -> list[tuple[list[str], str]
     appears in ANY `tool_result.p.anchors` this exchange. Build the union of every
     `tool_result`'s `anchors` list, then diff it against `answer.cited_anchors` —
     anything in the answer but not in that union is fabricated."""
-    return []
+    # 1. Tìm sự kiện "answer" cuối cùng
+    final_answer = final_answer_event(trace)
+    if not final_answer:
+        return []
+        
+    answer_p = final_answer.get("p", {})
+    cited_anchors = answer_p.get("cited_anchors", [])
+    if not cited_anchors:
+        return []
+
+    # 2. Thu thập mọi anchor hợp lệ được trả về từ các lệnh gọi Tool
+    valid_anchors = set()
+    for g in group_calls(trace):
+        if g.tool_result is not None:
+            result_p = g.tool_result.get("p") if isinstance(g.tool_result.get("p"), Mapping) else {}
+            # Chỉ thu thập khi lệnh thành công (ok=True)
+            if result_p.get("ok", False):
+                valid_anchors.update(result_p.get("anchors", []))
+
+    # 3. So khớp: Có anchor nào được trích dẫn nhưng KHÔNG nằm trong valid_anchors không?
+    hits = []
+    for anchor in cited_anchors:
+        if anchor not in valid_anchors:
+            # Chứng minh: Cite bằng chính anchor bị bịa ra
+            argument = (
+                f"Agent cited anchor '{anchor}' in the final answer, but this anchor "
+                f"was never returned in any tool_result's 'anchors' list this exchange."
+            )[:MAX_ARGUMENT_CHARS]
+            
+            # Cấu trúc claim bắt buộc: list chứa [evidence_refs], argument string
+            hits.append(([anchor_ref(anchor)], argument))
+            
+    return hits
 
 
 def _hook_hallucination(trace, answer, card) -> list[tuple[list[str], str]]:

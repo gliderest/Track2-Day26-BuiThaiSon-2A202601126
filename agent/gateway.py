@@ -88,6 +88,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, runtime_checkable
 
+from agent.strategy import successor_of, is_catalog_trap, pick_replica
+
 # kit.mcp.types is a collaborator's file (workspace hard rule 2: import it,
 # degrade gracefully). It is present as of this writing and is core, stable
 # infrastructure (CONTRACTS.md 3.1) — but this module must still not fail to
@@ -377,6 +379,49 @@ class Gateway:
         # REWRITING `cmd.headers["mcp-replica"]` (verdict="rewrite") rather
         # than silently trusting whatever the model asked for.
         routed = cmd  # starter: no rerouting — pass the command through untouched
+        verdict = "forward"
+
+        # 1.1 Cập nhật tool đã bị deprecated (vd: slides.search -> slides.query)
+        # Tránh lỗi 'wasteful' khi dùng tool cũ.
+        succ = successor_of(routed.server, routed.tool)
+        if succ is not None:
+            routed = Command(
+                cmd_id=routed.cmd_id,
+                kind=routed.kind,
+                raw=routed.raw,
+                server=succ[0],
+                tool=succ[1],
+                args=routed.args,
+                fields=routed.fields,
+                headers=routed.headers,
+                lease_id=routed.lease_id,
+                call_index=routed.call_index,
+            )
+            verdict = "rewrite"
+
+        # 1.2 Chống lại 'replica_flip' attack (Stale Read)
+        if "mcp-replica" in routed.headers:
+            anchor = routed.args.get("anchor", "unknown")
+            # Kiểm tra xem anchor này có đang bị drift không (cần track state ở ngoài, tạm mặc định False)
+            is_drifting = anchor in getattr(self, "_drifting_anchors", set())
+            
+            choice = pick_replica(path_id=anchor, known_drifting=is_drifting)
+            if routed.headers["mcp-replica"] != choice.replica:
+                new_headers = dict(routed.headers)
+                new_headers["mcp-replica"] = choice.replica
+                routed = Command(
+                    cmd_id=routed.cmd_id,
+                    kind=routed.kind,
+                    raw=routed.raw,
+                    server=routed.server,
+                    tool=routed.tool,
+                    args=routed.args,
+                    fields=routed.fields,
+                    headers=new_headers,
+                    lease_id=routed.lease_id,
+                    call_index=routed.call_index,
+                )
+                verdict = "rewrite"
 
         # ------------------------------------------------------------------
         # JOB 2 — ADMIT: is this call worth letting through AT ALL, before
@@ -389,6 +434,9 @@ class Gateway:
         # (CONTRACTS.md 4.1's charging table has exactly one $0 row, and
         # this is it). A `deny` you can defend beats a `forward` you can't.
         # starter: admits every command unconditionally.
+
+        if routed.tool == "get_frame" and routed.lease_id not in self.ctx.leases:
+            return self.deny(cmd, reason="Lease expired or invalid for get_frame")
 
         # ------------------------------------------------------------------
         # JOB 3 — AUTHORIZE: does `routed` actually belong to WHOM YOU SERVE?
@@ -405,6 +453,18 @@ class Gateway:
         # starter: never checks `self.ctx.act` / `self.ctx.scopes` at all —
         # this is a real hole, left open on purpose for you to close.
 
+        for key in ["learner", "learner_id", "user", "act", "target"]:
+            if key in routed.args:
+                target_id = routed.args[key]
+                if target_id != self.ctx.act:
+                    return self.deny(cmd, reason=f"Spoofing attempt: Action target {target_id} does not match {self.ctx.act}")
+
+        is_write = any(w in routed.tool for w in ["write", "update", "set", "submit", "create"])
+        if is_write:
+            write_prefix = f"{routed.server}.write"
+            if not any(s.startswith(write_prefix) for s in self.ctx.scopes):
+                return self.deny(cmd, reason=f"Authority exceeded: Missing write scope for {routed.server}")
+
         # ------------------------------------------------------------------
         # JOB 4 — BUDGET: can the DUEL (all 10 rounds, not just this call)
         # actually afford `routed` as written?
@@ -419,6 +479,24 @@ class Gateway:
         # of forwarding the expensive mask verbatim.
         # starter: never rewrites a mask and never paces spend — it trusts
         # the model's own field mask exactly as written, every time.
+
+        # Đánh giá xem lệnh có rơi vào bẫy list_servers / list_terms gọi bằng mask "*" không
+        if is_catalog_trap(routed.server, routed.tool, routed.fields):
+            # Ép fields về ("name",) để cứu 10-12 credits mỗi lần gọi
+            cheap_fields = ("name",)
+            routed = Command(
+                cmd_id=routed.cmd_id,
+                kind=routed.kind,
+                raw=routed.raw,
+                server=routed.server,
+                tool=routed.tool,
+                args=routed.args,
+                fields=cheap_fields,
+                headers=routed.headers,
+                lease_id=routed.lease_id,
+                call_index=routed.call_index,
+            )
+            verdict = "rewrite"
 
         call = self._to_tool_call(routed)
         decision = Decision(verdict="forward", call=call)

@@ -1,6 +1,6 @@
 PY := python3.12
 VENV := .venv
-BIN := $(VENV)/bin
+BIN := $(VENV)/Scripts
 BOT ?= rookie
 # `AS` is a GNU make BUILT-IN (the assembler, default `as`), so `AS ?= all`
 # never fired and a plain `make spar BOT=rookie` ran `spar.py --as as`, which
